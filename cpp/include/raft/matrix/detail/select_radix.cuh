@@ -219,8 +219,7 @@ _RAFT_DEVICE void filter_and_histogram(const T* in_buf,
                                        Counter<T, IdxT>* counter,
                                        IdxT* histogram,
                                        bool select_min,
-                                       int pass,
-                                       bool early_stop)
+                                       int pass)
 {
   constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
   __shared__ IdxT histogram_smem[num_buckets];
@@ -263,32 +262,25 @@ _RAFT_DEVICE void filter_and_histogram(const T* in_buf,
               previous_start_bit,
               kth_value_bits,
               p_filter_cnt,
-              p_out_cnt,
-              early_stop](T value, IdxT i) {
+              p_out_cnt](T value, IdxT i) {
       const auto previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
                                  << previous_start_bit;
       if (previous_bits == kth_value_bits) {
-        if (early_stop) {
-          IdxT pos     = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-          out[pos]     = value;
-          out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
-        } else {
-          if (out_buf) {
-            IdxT pos         = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
-            out_buf[pos]     = value;
-            out_idx_buf[pos] = in_idx_buf ? in_idx_buf[i] : i;
-          }
-
-          int bucket = calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-          atomicAdd(histogram_smem + bucket, static_cast<IdxT>(1));
+        if (out_buf) {
+          IdxT pos         = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+          out_buf[pos]     = value;
+          out_idx_buf[pos] = in_idx_buf ? in_idx_buf[i] : i;
         }
+
+        int bucket = calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
+        atomicAdd(histogram_smem + bucket, static_cast<IdxT>(1));
       }
       // the condition `(out_buf || early_stop)` is a little tricky:
       // If we skip writing to `out_buf` (when `out_buf` is nullptr), we should skip writing to
       // `out` too. So we won't write the same value to `out` multiple times in different passes.
       // And if we keep skipping the writing, values will be written in `last_filter_kernel()` at
       // last. But when `early_stop` is true, we need to write to `out` since it's the last chance.
-      else if ((out_buf || early_stop) && previous_bits < kth_value_bits) {
+      else if (out_buf && previous_bits < kth_value_bits) {
         IdxT pos     = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
         out[pos]     = value;
         out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
@@ -300,7 +292,6 @@ _RAFT_DEVICE void filter_and_histogram(const T* in_buf,
                        previous_len,
                        f);
   }
-  if (early_stop) { return; }
   __syncthreads();
 
   // merge histograms produced by individual blocks
@@ -389,11 +380,11 @@ _RAFT_DEVICE void last_filter(const T* in_buf,
                               IdxT current_len,
                               IdxT k,
                               Counter<T, IdxT>* counter,
-                              const bool select_min,
-                              const int pass)
+                              const bool select_min)
 {
   const auto kth_value_bits = counter->kth_value_bits;
-  const int start_bit       = calc_start_bit<T, BitsPerPass>(pass);
+  constexpr int pass        = calc_num_passes<T, BitsPerPass>() - 1;
+  constexpr int start_bit   = calc_start_bit<T, BitsPerPass>(pass);
 
   // changed in choose_bucket(); need to reload
   const IdxT needed_num_of_kth = counter->k;
@@ -564,8 +555,7 @@ __global__ void radix_kernel(const T* in,
   // When k=len, early_stop will be true at pass 0. It means filter_and_histogram() should handle
   // correctly the case that pass=0 and early_stop=true. However, this special case of k=len is
   // handled in other way in select_k() so such case is not possible here.
-  const bool early_stop = (current_len == current_k);
-  const IdxT buf_len    = calc_buf_len<T>(len);
+  const IdxT buf_len = calc_buf_len<T>(len);
 
   // "previous_len > buf_len" means previous pass skips writing buffer
   if (pass == 0 || pass == 1 || previous_len > buf_len) {
@@ -600,8 +590,7 @@ __global__ void radix_kernel(const T* in,
                                              counter,
                                              histogram,
                                              select_min,
-                                             pass,
-                                             early_stop);
+                                             pass);
   __threadfence();
 
   bool isLastBlock = false;
@@ -611,15 +600,6 @@ __global__ void radix_kernel(const T* in,
   }
 
   if (__syncthreads_or(isLastBlock)) {
-    if (early_stop) {
-      if (threadIdx.x == 0) {
-        // `last_filter_kernel()` requires setting previous_len
-        counter->previous_len = 0;
-        counter->len          = 0;
-      }
-      return;
-    }
-
     scan<IdxT, BitsPerPass, BlockSize>(histogram);
     __syncthreads();
     choose_bucket<T, IdxT, BitsPerPass>(counter, histogram, current_k, pass);
@@ -648,8 +628,7 @@ __global__ void radix_kernel(const T* in,
                                           out_buf ? current_len : len,
                                           k,
                                           counter,
-                                          select_min,
-                                          pass);
+                                          select_min);
       }
     }
   }
@@ -982,7 +961,7 @@ __global__ void radix_topk_one_block_kernel(const T* in,
     if (threadIdx.x == 0) { counter.previous_len = current_len; }
     __syncthreads();
 
-    if (counter.len == counter.k || pass == num_passes - 1) {
+    if (pass == num_passes - 1) {
       last_filter<T, IdxT, BitsPerPass>(pass == 0 ? in : out_buf,
                                         pass == 0 ? in_idx : out_idx_buf,
                                         out,
@@ -990,8 +969,7 @@ __global__ void radix_topk_one_block_kernel(const T* in,
                                         current_len,
                                         k,
                                         &counter,
-                                        select_min,
-                                        pass);
+                                        select_min);
       break;
     }
   }
